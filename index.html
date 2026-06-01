@@ -1,0 +1,1009 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#8fc9f4">
+  <title></title>
+  <style>
+    html,
+    body {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      overflow: hidden;
+      background:
+        radial-gradient(circle at 36% 30%, rgba(255, 244, 208, 0.45), transparent 32%),
+        linear-gradient(180deg, #6eb5ed 0%, #91cdf4 52%, #d7ecfb 100%);
+      cursor: grab;
+      touch-action: none;
+      user-select: none;
+      -webkit-user-select: none;
+    }
+
+    body.is-dragging {
+      cursor: grabbing;
+    }
+
+    canvas {
+      position: fixed;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      display: block;
+    }
+  </style>
+</head>
+<body>
+<script type="module">
+const THREE_URL = "https://cdn.jsdelivr.net/npm/three@0.164.1/build/three.module.js";
+const skyRoot = document.documentElement;
+
+function publishSkyState(state) {
+  for (const [key, value] of Object.entries(state)) {
+    skyRoot.dataset[key] = String(value);
+  }
+}
+
+window.addEventListener("error", event => {
+  publishSkyState({ skyError: event.message || "error" });
+});
+
+window.addEventListener("unhandledrejection", event => {
+  publishSkyState({ skyError: event.reason && event.reason.message ? event.reason.message : "promise" });
+});
+
+let THREE;
+publishSkyState({ skyStage: "loading" });
+try {
+  THREE = await import(THREE_URL);
+  publishSkyState({ skyStage: "three-imported" });
+  createSky(THREE);
+} catch (error) {
+  publishSkyState({ skyError: error && error.message ? error.message : "import", skyStage: "fallback" });
+  createCanvasFallback();
+}
+
+function createSky(THREE) {
+  publishSkyState({ skyMode: "three", skyStage: "three-start" });
+  const TAU = Math.PI * 2;
+  const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
+  const lerp = (a, b, t) => a + (b - a) * t;
+  const smoother = (edge0, edge1, value) => {
+    const t = clamp((value - edge0) / (edge1 - edge0), 0, 1);
+    return t * t * (3 - 2 * t);
+  };
+
+  const mobile = window.matchMedia("(pointer: coarse)").matches || Math.min(innerWidth, innerHeight) < 760;
+  const quality = mobile ? 0.72 : 1;
+  const maxPixelRatio = mobile ? 1.45 : 1.9;
+
+  const renderer = new THREE.WebGLRenderer({
+    alpha: false,
+    antialias: true,
+    powerPreference: "high-performance",
+    preserveDrawingBuffer: true
+  });
+  renderer.outputColorSpace = THREE.SRGBColorSpace;
+  renderer.toneMapping = THREE.ACESFilmicToneMapping;
+  renderer.toneMappingExposure = 0.96;
+  renderer.setClearColor(0x90ccf4, 1);
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, maxPixelRatio));
+  document.body.appendChild(renderer.domElement);
+  publishSkyState({ skyStage: "three-renderer" });
+
+  const scene = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera(64, 1, 0.1, 18000);
+  camera.position.set(0, 0, 0);
+  camera.up.set(0, 0, -1);
+
+  const sunDirection = new THREE.Vector3(-0.28, 0.865, -0.415).normalize();
+  const wind = new THREE.Vector2(0.78, -0.31).normalize();
+  const clock = new THREE.Clock();
+  const tempObject = new THREE.Object3D();
+  const cameraRight = new THREE.Vector3(1, 0, 0);
+  const cameraUp = new THREE.Vector3(0, 0, -1);
+  const cameraForward = new THREE.Vector3();
+  const cameraDirection = new THREE.Vector3();
+  const sunScreenPosition = new THREE.Vector3();
+  const lookDirection = new THREE.Vector3();
+  const samplePixel = new Uint8Array(4);
+
+  let yaw = -0.18;
+  let tilt = 0.12;
+  let targetYaw = -0.18;
+  let targetTilt = 0.12;
+  let sensorYaw = 0;
+  let sensorTilt = 0;
+  let sunOcclusion = 0;
+  let frame = 0;
+  let cameraInitialized = false;
+  let orientationBase = null;
+  let orientationStarted = false;
+
+  const skyUniforms = {
+    uSunDir: { value: sunDirection },
+    uTime: { value: 0 },
+    uOcclusion: { value: 0 }
+  };
+
+  const sky = new THREE.Mesh(
+    new THREE.SphereGeometry(10000, 96, 48),
+    new THREE.ShaderMaterial({
+      uniforms: skyUniforms,
+      side: THREE.BackSide,
+      depthWrite: false,
+      depthTest: false,
+      vertexShader: `
+        varying vec3 vDirection;
+
+        void main() {
+          vec4 worldPosition = modelMatrix * vec4(position, 1.0);
+          vDirection = normalize(worldPosition.xyz - cameraPosition);
+          gl_Position = projectionMatrix * viewMatrix * worldPosition;
+        }
+      `,
+      fragmentShader: `
+        precision highp float;
+
+        uniform vec3 uSunDir;
+        uniform float uTime;
+        uniform float uOcclusion;
+        varying vec3 vDirection;
+
+        float hash(vec2 p) {
+          return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453123);
+        }
+
+        float noise(vec2 p) {
+          vec2 i = floor(p);
+          vec2 f = fract(p);
+          f = f * f * (3.0 - 2.0 * f);
+          float a = hash(i);
+          float b = hash(i + vec2(1.0, 0.0));
+          float c = hash(i + vec2(0.0, 1.0));
+          float d = hash(i + vec2(1.0, 1.0));
+          return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+        }
+
+        void main() {
+          vec3 dir = normalize(vDirection);
+          float up = clamp(dir.y, -0.18, 1.0);
+          float zenith = smoothstep(-0.04, 1.0, up);
+          float horizon = pow(1.0 - clamp(up, 0.0, 1.0), 2.15);
+          float sunDot = max(dot(dir, uSunDir), 0.0);
+
+          vec3 highBlue = vec3(0.155, 0.435, 0.735);
+          vec3 openBlue = vec3(0.295, 0.625, 0.915);
+          vec3 paleBlue = vec3(0.715, 0.875, 0.985);
+          vec3 sky = mix(paleBlue, openBlue, smoothstep(0.02, 0.55, zenith));
+          sky = mix(sky, highBlue, pow(zenith, 1.8) * 0.55);
+
+          float thinVariation = noise(dir.xz * 2.15 + vec2(uTime * 0.002, -uTime * 0.001));
+          sky += (thinVariation - 0.5) * 0.018 * vec3(0.35, 0.55, 0.85);
+
+          float warmAir = pow(sunDot, 2.5) * 0.09 + pow(sunDot, 8.0) * 0.13;
+          float broadGlow = pow(sunDot, 18.0) * 0.33;
+          float tightGlow = pow(sunDot, 360.0) * 1.18;
+          float pinGlow = pow(sunDot, 1250.0) * 1.95;
+          float dim = mix(1.0, 0.44, uOcclusion);
+
+          sky += vec3(1.0, 0.79, 0.48) * (warmAir + broadGlow * dim);
+          sky += vec3(1.0, 0.91, 0.72) * (tightGlow + pinGlow) * dim;
+          sky = mix(sky, vec3(0.78, 0.895, 1.0), horizon * 0.34);
+
+          float opposite = pow(max(dot(dir, -uSunDir), 0.0), 2.0);
+          sky += opposite * vec3(0.018, 0.04, 0.095);
+          sky *= mix(1.0, 0.79, uOcclusion * 0.64);
+
+          gl_FragColor = vec4(sky, 1.0);
+        }
+      `
+    })
+  );
+  sky.renderOrder = 0;
+  scene.add(sky);
+
+  const sunUniforms = {
+    uOcclusion: { value: 0 },
+    uTime: { value: 0 }
+  };
+
+  const sun = new THREE.Mesh(
+    new THREE.PlaneGeometry(1, 1, 1, 1),
+    new THREE.ShaderMaterial({
+      uniforms: sunUniforms,
+      transparent: true,
+      depthWrite: false,
+      depthTest: false,
+      blending: THREE.AdditiveBlending,
+      side: THREE.DoubleSide,
+      vertexShader: `
+        varying vec2 vUv;
+
+        void main() {
+          vUv = uv;
+          gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+        }
+      `,
+      fragmentShader: `
+        precision highp float;
+
+        uniform float uOcclusion;
+        uniform float uTime;
+        varying vec2 vUv;
+
+        float hash(vec2 p) {
+          return fract(sin(dot(p, vec2(41.2, 289.7))) * 12718.927);
+        }
+
+        void main() {
+          vec2 p = (vUv - 0.5) * 2.0;
+          float r = length(p);
+          float shimmer = hash(floor(p * 18.0 + uTime * 0.04)) * 0.018;
+          float core = exp(-r * r * 86.0);
+          float inner = exp(-r * r * 18.5);
+          float halo = exp(-r * r * 2.25);
+          float veil = exp(-r * r * 0.52);
+          float dim = mix(1.0, 0.28, uOcclusion);
+          float alpha = (core * 0.46 + inner * 0.31 + halo * 0.22 + veil * 0.11) * dim;
+          alpha *= smoothstep(1.25, 0.06, r);
+          vec3 color = vec3(1.0, 0.91, 0.70) * (inner + halo * 0.75);
+          color += vec3(1.0, 0.98, 0.9) * core * 1.05;
+          color += vec3(0.95, 0.67, 0.34) * veil * 0.32;
+          gl_FragColor = vec4(color * (1.0 + shimmer), alpha);
+        }
+      `
+    })
+  );
+  sun.position.copy(sunDirection).multiplyScalar(5400);
+  sun.scale.set(940, 940, 1);
+  sun.renderOrder = 1;
+  sun.frustumCulled = false;
+  scene.add(sun);
+
+  const cloudVertexShader = `
+    attribute vec3 iOffset;
+    attribute vec2 iScale;
+    attribute float iSeed;
+    attribute float iOpacity;
+    attribute vec2 iDrift;
+    attribute float iShade;
+    attribute float iRotation;
+
+    uniform float uTime;
+    uniform float uArea;
+    uniform vec3 uCameraRight;
+    uniform vec3 uCameraUp;
+
+    varying vec2 vUv;
+    varying float vSeed;
+    varying float vOpacity;
+    varying float vShade;
+    varying vec3 vWorld;
+
+    float wrapAxis(float value, float area) {
+      return mod(value + area * 0.5, area) - area * 0.5;
+    }
+
+    void main() {
+      vec3 center = iOffset;
+      center.x = wrapAxis(center.x + iDrift.x * uTime, uArea);
+      center.z = wrapAxis(center.z + iDrift.y * uTime, uArea);
+
+      float breathe = 1.0 + sin(uTime * 0.018 + iSeed * 6.217) * 0.012;
+      float c = cos(iRotation);
+      float s = sin(iRotation);
+      vec2 local = vec2(
+        position.x * c - position.y * s,
+        position.x * s + position.y * c
+      );
+      vec3 world = center
+        + uCameraRight * local.x * iScale.x * breathe
+        + uCameraUp * local.y * iScale.y * breathe;
+
+      vUv = uv;
+      vSeed = iSeed;
+      vOpacity = iOpacity;
+      vShade = iShade;
+      vWorld = world;
+      gl_Position = projectionMatrix * viewMatrix * vec4(world, 1.0);
+    }
+  `;
+
+  const cloudFragmentShader = `
+    precision highp float;
+
+    uniform float uTime;
+    uniform float uOcclusion;
+    uniform vec3 uSunDir;
+    uniform vec3 uCameraRight;
+    uniform vec3 uCameraUp;
+    uniform vec3 uHazeColor;
+    uniform float uHaze;
+    uniform float uLayerLift;
+
+    varying vec2 vUv;
+    varying float vSeed;
+    varying float vOpacity;
+    varying float vShade;
+    varying vec3 vWorld;
+
+    float hash(vec2 p) {
+      return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453123);
+    }
+
+    float noise(vec2 p) {
+      vec2 i = floor(p);
+      vec2 f = fract(p);
+      f = f * f * (3.0 - 2.0 * f);
+      float a = hash(i);
+      float b = hash(i + vec2(1.0, 0.0));
+      float c = hash(i + vec2(0.0, 1.0));
+      float d = hash(i + vec2(1.0, 1.0));
+      return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+    }
+
+    float fbm(vec2 p) {
+      float value = 0.0;
+      float amp = 0.52;
+      for (int i = 0; i < 4; i++) {
+        value += amp * noise(p);
+        p = mat2(1.62, -1.14, 1.14, 1.62) * p + 17.31;
+        amp *= 0.5;
+      }
+      return value;
+    }
+
+    void main() {
+      vec2 p = vUv - 0.5;
+      vec2 seedOffset = vec2(vSeed * 13.71, vSeed * 4.37);
+      float slowTime = uTime * 0.012;
+      float wide = fbm(vUv * 3.15 + seedOffset + vec2(slowTime, -slowTime * 0.42));
+      float curl = fbm(vUv * 8.5 + seedOffset * 0.73 + vec2(-slowTime * 0.38, slowTime * 0.72));
+      float grain = fbm(vUv * 19.0 + seedOffset * 1.91);
+
+      float radius = length(p * vec2(0.96 + wide * 0.17, 1.16));
+      float brokenEdge = mix(wide, curl, 0.48) + grain * 0.16;
+      float envelope = exp(-radius * radius * (5.2 - wide * 0.9));
+      float outerFalloff = 1.0 - smoothstep(0.5 + wide * 0.08, 0.86 + curl * 0.08, radius);
+      float edgeFade = smoothstep(0.0, 0.18, vUv.x)
+        * smoothstep(0.0, 0.18, vUv.y)
+        * smoothstep(0.0, 0.18, 1.0 - vUv.x)
+        * smoothstep(0.0, 0.18, 1.0 - vUv.y);
+      float lowerSoftening = smoothstep(-0.52, -0.12, p.y + curl * 0.1);
+      float density = envelope * outerFalloff * mix(0.52, 1.18, brokenEdge);
+      density *= mix(0.75, 1.0, lowerSoftening);
+      density *= edgeFade;
+      density = pow(clamp(density, 0.0, 1.0), 1.42);
+
+      if (density < 0.012) discard;
+
+      vec2 sunOnBillboard = normalize(vec2(dot(uSunDir, uCameraRight), dot(uSunDir, uCameraUp)) + vec2(0.0001));
+      float facingSun = dot(normalize(p + vec2(0.0001)), sunOnBillboard);
+      float silverEdge = smoothstep(0.1, 0.98, facingSun) * (1.0 - smoothstep(0.34, 0.88, density));
+      float sunFacingCloud = pow(max(dot(normalize(vWorld), uSunDir), 0.0), 0.42);
+      float lit = clamp(sunFacingCloud * 0.74 + vShade * 0.22 + uLayerLift, 0.0, 1.25);
+
+      vec3 coolBase = vec3(0.65, 0.72, 0.80);
+      vec3 milk = vec3(0.97, 0.975, 0.94);
+      vec3 sunWarmth = vec3(1.0, 0.86, 0.62);
+      vec3 color = mix(coolBase, milk, lit);
+      color = mix(color, vec3(0.78, 0.82, 0.86), density * 0.18);
+      color += sunWarmth * silverEdge * (0.22 + uOcclusion * 0.2);
+      color = mix(color, uHazeColor, smoothstep(700.0, 3600.0, length(vWorld)) * uHaze);
+
+      float alpha = density * vOpacity;
+      alpha *= mix(1.0, 0.84, smoothstep(900.0, 4200.0, length(vWorld)));
+      alpha *= mix(1.0, 0.92, uOcclusion * 0.35);
+
+      gl_FragColor = vec4(color, alpha);
+    }
+  `;
+
+  const occluders = [];
+  const layers = [
+    createCloudLayer({
+      seed: 13,
+      area: 7600,
+      masses: Math.round(48 * quality),
+      puffs: [7, 13],
+      altitude: [1080, 1560],
+      radius: [260, 620],
+      puffScale: [0.62, 1.04],
+      opacity: [0.09, 0.2],
+      speed: 0.38,
+      yDepth: 42,
+      haze: 0.42,
+      layerLift: 0.2,
+      renderOrder: 2,
+      sunMasses: 1
+    }),
+    createCloudLayer({
+      seed: 31,
+      area: 5700,
+      masses: Math.round(54 * quality),
+      puffs: [9, 17],
+      altitude: [700, 1080],
+      radius: [190, 440],
+      puffScale: [0.72, 1.12],
+      opacity: [0.18, 0.35],
+      speed: 0.68,
+      yDepth: 58,
+      haze: 0.25,
+      layerLift: 0.1,
+      renderOrder: 3,
+      sunMasses: 3
+    }),
+    createCloudLayer({
+      seed: 57,
+      area: 4200,
+      masses: Math.round(28 * quality),
+      puffs: [10, 19],
+      altitude: [460, 720],
+      radius: [145, 310],
+      puffScale: [0.82, 1.22],
+      opacity: [0.24, 0.43],
+      speed: 0.92,
+      yDepth: 72,
+      haze: 0.11,
+      layerLift: 0.0,
+      renderOrder: 4,
+      sunMasses: 2
+    })
+  ];
+  publishSkyState({ skyStage: "three-clouds", skyInstances: layers.reduce((total, layer) => total + layer.geometry.instanceCount, 0) });
+
+  function mulberry32(seed) {
+    let value = seed >>> 0;
+    return () => {
+      value += 0x6D2B79F5;
+      let t = value;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  function randomRange(random, min, max) {
+    return lerp(min, max, random());
+  }
+
+  function wrapAxis(value, area) {
+    return ((value + area * 0.5) % area + area) % area - area * 0.5;
+  }
+
+  function createCloudLayer(config) {
+    const random = mulberry32(config.seed);
+    const masses = [];
+    const normalMasses = config.masses;
+    for (let i = 0; i < normalMasses; i++) {
+      const angle = random() * TAU;
+      const distance = Math.sqrt(random()) * config.area * 0.45;
+      const altitude = randomRange(random, config.altitude[0], config.altitude[1]);
+      const radius = randomRange(random, config.radius[0], config.radius[1]);
+      masses.push({
+        x: Math.cos(angle) * distance,
+        y: altitude,
+        z: Math.sin(angle) * distance,
+        radius,
+        rotation: random() * TAU,
+        puffs: Math.floor(randomRange(random, config.puffs[0], config.puffs[1] + 1)),
+        driftX: (wind.x + randomRange(random, -0.16, 0.14)) * config.speed,
+        driftZ: (wind.y + randomRange(random, -0.13, 0.15)) * config.speed,
+        density: randomRange(random, 0.72, 1.18),
+        area: config.area
+      });
+    }
+
+    for (let i = 0; i < config.sunMasses; i++) {
+      const altitude = randomRange(random, config.altitude[0], config.altitude[1]);
+      const distance = altitude / sunDirection.y;
+      const radius = randomRange(random, config.radius[0] * 0.95, config.radius[1] * 1.12);
+      const alongWind = randomRange(random, -radius * 1.4, radius * 1.9);
+      const crossWind = randomRange(random, -radius * 0.62, radius * 0.62);
+      const side = new THREE.Vector2(-wind.y, wind.x);
+      masses.push({
+        x: sunDirection.x * distance - wind.x * alongWind + side.x * crossWind,
+        y: altitude,
+        z: sunDirection.z * distance - wind.y * alongWind + side.y * crossWind,
+        radius,
+        rotation: random() * TAU,
+        puffs: Math.floor(randomRange(random, config.puffs[1] * 0.9, config.puffs[1] * 1.55)),
+        driftX: (wind.x + randomRange(random, -0.08, 0.1)) * config.speed,
+        driftZ: (wind.y + randomRange(random, -0.08, 0.1)) * config.speed,
+        density: randomRange(random, 0.86, 1.26),
+        area: config.area,
+        occludesSun: true
+      });
+    }
+
+    let instanceCount = 0;
+    for (const mass of masses) instanceCount += mass.puffs;
+
+    const offsets = new Float32Array(instanceCount * 3);
+    const scales = new Float32Array(instanceCount * 2);
+    const seeds = new Float32Array(instanceCount);
+    const opacities = new Float32Array(instanceCount);
+    const drifts = new Float32Array(instanceCount * 2);
+    const shades = new Float32Array(instanceCount);
+    const rotations = new Float32Array(instanceCount);
+    let cursor = 0;
+
+    for (const mass of masses) {
+      const cosR = Math.cos(mass.rotation);
+      const sinR = Math.sin(mass.rotation);
+      const stretch = randomRange(random, 1.12, 2.42);
+      const cross = randomRange(random, 0.58, 1.04);
+
+      occluders.push({
+        x: mass.x,
+        y: mass.y,
+        z: mass.z,
+        radius: mass.radius * (mass.occludesSun ? 1.32 : 1.08),
+        driftX: mass.driftX,
+        driftZ: mass.driftZ,
+        area: config.area,
+        density: mass.density * (mass.occludesSun ? 1.0 : 0.42)
+      });
+
+      for (let i = 0; i < mass.puffs; i++) {
+        const puffAngle = random() * TAU;
+        const puffDistance = Math.pow(random(), 0.76) * mass.radius;
+        const localX = Math.cos(puffAngle) * puffDistance * stretch;
+        const localZ = Math.sin(puffAngle) * puffDistance * cross;
+        const rotatedX = localX * cosR - localZ * sinR;
+        const rotatedZ = localX * sinR + localZ * cosR;
+        const vertical = randomRange(random, -config.yDepth, config.yDepth) * (0.3 + Math.pow(random(), 1.9));
+
+        offsets[cursor * 3] = mass.x + rotatedX;
+        offsets[cursor * 3 + 1] = mass.y + vertical;
+        offsets[cursor * 3 + 2] = mass.z + rotatedZ;
+
+        const puffScale = randomRange(random, config.puffScale[0], config.puffScale[1]);
+        scales[cursor * 2] = mass.radius * randomRange(random, 0.32, 0.78) * puffScale;
+        scales[cursor * 2 + 1] = mass.radius * randomRange(random, 0.2, 0.52) * puffScale;
+        seeds[cursor] = random() * 1000;
+        opacities[cursor] = randomRange(random, config.opacity[0], config.opacity[1]) * mass.density;
+        drifts[cursor * 2] = mass.driftX;
+        drifts[cursor * 2 + 1] = mass.driftZ;
+        shades[cursor] = randomRange(random, 0.76, 1.14);
+        rotations[cursor] = mass.rotation * 0.22 + randomRange(random, -1.15, 1.15);
+        cursor++;
+      }
+    }
+
+    const basePlane = new THREE.PlaneGeometry(1, 1, 1, 1);
+    const geometry = new THREE.InstancedBufferGeometry();
+    geometry.setIndex(basePlane.index);
+    geometry.setAttribute("position", basePlane.attributes.position);
+    geometry.setAttribute("uv", basePlane.attributes.uv);
+    geometry.setAttribute("iOffset", new THREE.InstancedBufferAttribute(offsets, 3));
+    geometry.setAttribute("iScale", new THREE.InstancedBufferAttribute(scales, 2));
+    geometry.setAttribute("iSeed", new THREE.InstancedBufferAttribute(seeds, 1));
+    geometry.setAttribute("iOpacity", new THREE.InstancedBufferAttribute(opacities, 1));
+    geometry.setAttribute("iDrift", new THREE.InstancedBufferAttribute(drifts, 2));
+    geometry.setAttribute("iShade", new THREE.InstancedBufferAttribute(shades, 1));
+    geometry.setAttribute("iRotation", new THREE.InstancedBufferAttribute(rotations, 1));
+    geometry.instanceCount = instanceCount;
+    geometry.boundingSphere = new THREE.Sphere(new THREE.Vector3(0, (config.altitude[0] + config.altitude[1]) * 0.5, 0), config.area * 1.35);
+
+    const material = new THREE.ShaderMaterial({
+      uniforms: {
+        uTime: { value: 0 },
+        uArea: { value: config.area },
+        uCameraRight: { value: cameraRight.clone() },
+        uCameraUp: { value: cameraUp.clone() },
+        uSunDir: { value: sunDirection },
+        uOcclusion: { value: 0 },
+        uHazeColor: { value: new THREE.Color(0xc8e6fb) },
+        uHaze: { value: config.haze },
+        uLayerLift: { value: config.layerLift }
+      },
+      vertexShader: cloudVertexShader,
+      fragmentShader: cloudFragmentShader,
+      transparent: true,
+      depthWrite: false,
+      depthTest: false,
+      blending: THREE.NormalBlending,
+      side: THREE.DoubleSide
+    });
+
+    const mesh = new THREE.Mesh(geometry, material);
+    mesh.frustumCulled = false;
+    mesh.renderOrder = config.renderOrder;
+    scene.add(mesh);
+    basePlane.dispose();
+    return mesh;
+  }
+
+  function directionFromAngles(viewYaw, viewTilt) {
+    const sinTilt = Math.sin(viewTilt);
+    lookDirection.set(
+      Math.sin(viewYaw) * sinTilt,
+      Math.cos(viewTilt),
+      -Math.cos(viewYaw) * sinTilt
+    );
+    return lookDirection.normalize();
+  }
+
+  function updateCamera(elapsed, delta) {
+    const breathYaw = Math.sin(elapsed * 0.034) * 0.018 + Math.sin(elapsed * 0.011) * 0.012;
+    const breathTilt = Math.sin(elapsed * 0.027 + 1.4) * 0.012;
+    const desiredYaw = targetYaw + sensorYaw + breathYaw;
+    const desiredTilt = clamp(targetTilt + sensorTilt + breathTilt, 0.02, 0.78);
+    const damping = 1 - Math.exp(-delta * 3.25);
+
+    yaw = lerp(yaw, desiredYaw, damping);
+    tilt = lerp(tilt, desiredTilt, damping);
+
+    tempObject.position.set(0, 0, 0);
+    tempObject.up.set(0, 0, -1);
+    tempObject.lookAt(directionFromAngles(yaw, tilt).multiplyScalar(-1));
+    if (cameraInitialized) {
+      camera.quaternion.slerp(tempObject.quaternion, 1 - Math.exp(-delta * 5.5));
+    } else {
+      camera.quaternion.copy(tempObject.quaternion);
+      cameraInitialized = true;
+    }
+    camera.updateMatrixWorld();
+    camera.matrixWorld.extractBasis(cameraRight, cameraUp, cameraForward);
+  }
+
+  function updateSunOcclusion(elapsed, delta) {
+    let coverage = 0;
+    const cloudPosition = new THREE.Vector3();
+    for (const cloud of occluders) {
+      cloudPosition.set(
+        wrapAxis(cloud.x + cloud.driftX * elapsed, cloud.area),
+        cloud.y,
+        wrapAxis(cloud.z + cloud.driftZ * elapsed, cloud.area)
+      );
+      const distance = cloudPosition.length();
+      const angularRadius = Math.atan(cloud.radius / distance);
+      const angle = cloudPosition.normalize().angleTo(sunDirection);
+      const cover = 1 - smoother(angularRadius * 0.28, angularRadius * 1.24, angle);
+      coverage += cover * cloud.density * 0.62;
+    }
+    coverage = clamp(coverage, 0, 0.86);
+    sunOcclusion = lerp(sunOcclusion, coverage, 1 - Math.exp(-delta * 0.42));
+  }
+
+  function resize() {
+    const width = Math.max(1, window.innerWidth);
+    const height = Math.max(1, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, maxPixelRatio));
+    renderer.setSize(width, height, false);
+    camera.aspect = width / height;
+    camera.updateProjectionMatrix();
+  }
+
+  function sampleCanvasSummary() {
+    const gl = renderer.getContext();
+    const canvas = renderer.domElement;
+    const points = [
+      [0.5, 0.5],
+      [0.28, 0.34],
+      [0.68, 0.38],
+      [0.42, 0.72],
+      [0.78, 0.68],
+      [0.2, 0.82]
+    ];
+    let nonBlack = 0;
+    let bright = 0;
+    let blue = 0;
+    for (const point of points) {
+      const x = Math.floor(point[0] * canvas.width);
+      const y = Math.floor((1 - point[1]) * canvas.height);
+      gl.readPixels(x, y, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, samplePixel);
+      if (samplePixel[0] + samplePixel[1] + samplePixel[2] > 24) nonBlack++;
+      if (samplePixel[0] + samplePixel[1] + samplePixel[2] > 560) bright++;
+      if (samplePixel[2] > samplePixel[0] && samplePixel[1] > samplePixel[0] * 0.78) blue++;
+    }
+    return { nonBlack, bright, blue };
+  }
+
+  function animate() {
+    const delta = Math.min(clock.getDelta(), 0.05);
+    const elapsed = clock.elapsedTime;
+    frame++;
+
+    updateCamera(elapsed, delta);
+    updateSunOcclusion(elapsed, delta);
+    camera.getWorldDirection(cameraDirection);
+    sunScreenPosition.copy(sun.position).project(camera);
+
+    skyUniforms.uTime.value = elapsed;
+    skyUniforms.uOcclusion.value = sunOcclusion;
+    sunUniforms.uTime.value = elapsed;
+    sunUniforms.uOcclusion.value = sunOcclusion;
+    sun.quaternion.copy(camera.quaternion);
+    renderer.toneMappingExposure = 0.96 - sunOcclusion * 0.12;
+
+    for (const layer of layers) {
+      layer.material.uniforms.uTime.value = elapsed;
+      layer.material.uniforms.uOcclusion.value = sunOcclusion;
+      layer.material.uniforms.uCameraRight.value.copy(cameraRight);
+      layer.material.uniforms.uCameraUp.value.copy(cameraUp);
+    }
+
+    renderer.render(scene, camera);
+    if (frame % 15 === 0) {
+      const canvasSummary = sampleCanvasSummary();
+      publishSkyState({
+        skyFrame: frame,
+        skyOcclusion: sunOcclusion.toFixed(3),
+        skyYaw: yaw.toFixed(3),
+        skyTilt: tilt.toFixed(3),
+        skyForwardX: cameraDirection.x.toFixed(3),
+        skyForwardY: cameraDirection.y.toFixed(3),
+        skyForwardZ: cameraDirection.z.toFixed(3),
+        skySunX: sunScreenPosition.x.toFixed(3),
+        skySunY: sunScreenPosition.y.toFixed(3),
+        skySunZ: sunScreenPosition.z.toFixed(3),
+        skyNonBlack: canvasSummary.nonBlack,
+        skyBright: canvasSummary.bright,
+        skyBlue: canvasSummary.blue
+      });
+    }
+    requestAnimationFrame(animate);
+  }
+
+  let pointerId = null;
+  let lastX = 0;
+  let lastY = 0;
+
+  function onPointerDown(event) {
+    pointerId = event.pointerId;
+    lastX = event.clientX;
+    lastY = event.clientY;
+    document.body.classList.add("is-dragging");
+    renderer.domElement.setPointerCapture(pointerId);
+    startOrientation();
+  }
+
+  function onPointerMove(event) {
+    if (event.pointerId !== pointerId) return;
+    const dx = event.clientX - lastX;
+    const dy = event.clientY - lastY;
+    lastX = event.clientX;
+    lastY = event.clientY;
+    targetYaw = clamp(targetYaw - dx * 0.0021, -1.18, 1.18);
+    targetTilt = clamp(targetTilt + dy * 0.00165, 0.02, 0.78);
+  }
+
+  function onPointerUp(event) {
+    if (event.pointerId !== pointerId) return;
+    document.body.classList.remove("is-dragging");
+    renderer.domElement.releasePointerCapture(pointerId);
+    pointerId = null;
+  }
+
+  function handleOrientation(event) {
+    if (event.beta == null || event.gamma == null) return;
+    if (!orientationBase) {
+      orientationBase = { beta: event.beta, gamma: event.gamma };
+      return;
+    }
+    const gamma = clamp((event.gamma - orientationBase.gamma) * 0.009, -0.34, 0.34);
+    const beta = clamp((event.beta - orientationBase.beta) * 0.006, -0.22, 0.28);
+    sensorYaw = lerp(sensorYaw, gamma, 0.04);
+    sensorTilt = lerp(sensorTilt, beta, 0.035);
+  }
+
+  async function startOrientation() {
+    if (orientationStarted || typeof DeviceOrientationEvent === "undefined") return;
+    orientationStarted = true;
+    try {
+      if (typeof DeviceOrientationEvent.requestPermission === "function") {
+        const permission = await DeviceOrientationEvent.requestPermission();
+        if (permission !== "granted") return;
+      }
+      window.addEventListener("deviceorientation", handleOrientation, { passive: true });
+    } catch (error) {
+      orientationStarted = false;
+    }
+  }
+
+  if (typeof DeviceOrientationEvent !== "undefined" && typeof DeviceOrientationEvent.requestPermission !== "function") {
+    startOrientation();
+  }
+
+  renderer.domElement.addEventListener("pointerdown", onPointerDown, { passive: true });
+  renderer.domElement.addEventListener("pointermove", onPointerMove, { passive: true });
+  renderer.domElement.addEventListener("pointerup", onPointerUp, { passive: true });
+  renderer.domElement.addEventListener("pointercancel", onPointerUp, { passive: true });
+  window.addEventListener("resize", resize, { passive: true });
+
+  window.__skyDiagnostics = () => {
+    const gl = renderer.getContext();
+    const canvas = renderer.domElement;
+    const points = [
+      [0.5, 0.5],
+      [0.28, 0.34],
+      [0.68, 0.38],
+      [0.42, 0.72],
+      [0.78, 0.68],
+      [0.2, 0.82]
+    ];
+    let nonBlack = 0;
+    let bright = 0;
+    let blue = 0;
+    const colors = [];
+    for (const point of points) {
+      const x = Math.floor(point[0] * canvas.width);
+      const y = Math.floor((1 - point[1]) * canvas.height);
+      gl.readPixels(x, y, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, samplePixel);
+      const color = [samplePixel[0], samplePixel[1], samplePixel[2], samplePixel[3]];
+      colors.push(color);
+      if (color[0] + color[1] + color[2] > 24) nonBlack++;
+      if (color[0] + color[1] + color[2] > 560) bright++;
+      if (color[2] > color[0] && color[1] > color[0] * 0.78) blue++;
+    }
+    return {
+      mode: "three",
+      frame,
+      width: canvas.width,
+      height: canvas.height,
+      yaw,
+      tilt,
+      sunOcclusion,
+      nonBlack,
+      bright,
+      blue,
+      colors
+    };
+  };
+
+  resize();
+  publishSkyState({ skyStage: "three-ready" });
+  animate();
+}
+
+function createCanvasFallback() {
+  publishSkyState({ skyMode: "canvas-fallback", skyStage: "fallback-start" });
+  const canvas = document.createElement("canvas");
+  const context = canvas.getContext("2d", { alpha: false });
+  document.body.appendChild(canvas);
+
+  const random = mulberry32(2049);
+  const clouds = [];
+  let frame = 0;
+  let drag = false;
+  let lastX = 0;
+  let lastY = 0;
+  let lookX = 0;
+  let lookY = 0;
+  let targetLookX = 0;
+  let targetLookY = 0;
+
+  for (let i = 0; i < 68; i++) {
+    clouds.push({
+      x: random(),
+      y: random(),
+      scale: 0.6 + random() * 1.7,
+      speed: 0.000018 + random() * 0.000026,
+      opacity: 0.18 + random() * 0.44,
+      seed: random() * 1000,
+      puffs: 8 + Math.floor(random() * 17)
+    });
+  }
+
+  function mulberry32(seed) {
+    let value = seed >>> 0;
+    return () => {
+      value += 0x6D2B79F5;
+      let t = value;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  function resize() {
+    const ratio = Math.min(devicePixelRatio || 1, 1.7);
+    canvas.width = Math.max(1, Math.floor(innerWidth * ratio));
+    canvas.height = Math.max(1, Math.floor(innerHeight * ratio));
+    canvas.style.width = innerWidth + "px";
+    canvas.style.height = innerHeight + "px";
+    context.setTransform(ratio, 0, 0, ratio, 0, 0);
+  }
+
+  function drawCloud(cloud, time, width, height) {
+    const localRandom = mulberry32(Math.floor(cloud.seed * 1000));
+    const baseX = (((cloud.x + time * cloud.speed) % 1) * 1.18 - 0.09) * width + lookX * 70 * cloud.scale;
+    const baseY = (cloud.y * 0.86 + 0.04) * height + lookY * 46 * cloud.scale;
+    const size = Math.min(width, height) * 0.17 * cloud.scale;
+    context.save();
+    context.globalAlpha = cloud.opacity;
+    context.filter = "blur(" + Math.max(8, size * 0.035) + "px)";
+    for (let i = 0; i < cloud.puffs; i++) {
+      const angle = localRandom() * Math.PI * 2;
+      const distance = Math.pow(localRandom(), 0.7) * size * 0.82;
+      const puffX = baseX + Math.cos(angle) * distance * 1.9;
+      const puffY = baseY + Math.sin(angle) * distance * 0.58;
+      const radiusX = size * (0.28 + localRandom() * 0.42);
+      const radiusY = size * (0.18 + localRandom() * 0.26);
+      const gradient = context.createRadialGradient(puffX, puffY, 0, puffX, puffY, radiusX);
+      gradient.addColorStop(0, "rgba(255, 255, 249, 0.96)");
+      gradient.addColorStop(0.56, "rgba(242, 246, 248, 0.54)");
+      gradient.addColorStop(1, "rgba(242, 246, 248, 0)");
+      context.fillStyle = gradient;
+      context.beginPath();
+      context.ellipse(puffX, puffY, radiusX, radiusY, angle * 0.17, 0, Math.PI * 2);
+      context.fill();
+    }
+    context.restore();
+  }
+
+  function animate(time) {
+    frame++;
+    const width = innerWidth;
+    const height = innerHeight;
+    lookX += (targetLookX - lookX) * 0.045;
+    lookY += (targetLookY - lookY) * 0.045;
+
+    const sky = context.createLinearGradient(0, 0, 0, height);
+    sky.addColorStop(0, "#64afec");
+    sky.addColorStop(0.56, "#93cef5");
+    sky.addColorStop(1, "#d8eefc");
+    context.fillStyle = sky;
+    context.fillRect(0, 0, width, height);
+
+    const sunX = width * (0.33 + lookX * 0.07);
+    const sunY = height * (0.27 + lookY * 0.05);
+    const sun = context.createRadialGradient(sunX, sunY, 0, sunX, sunY, Math.min(width, height) * 0.42);
+    sun.addColorStop(0, "rgba(255, 248, 220, 0.72)");
+    sun.addColorStop(0.18, "rgba(255, 223, 156, 0.24)");
+    sun.addColorStop(1, "rgba(255, 223, 156, 0)");
+    context.fillStyle = sun;
+    context.fillRect(0, 0, width, height);
+
+    clouds.sort((a, b) => a.scale - b.scale);
+    for (const cloud of clouds) drawCloud(cloud, time, width, height);
+    if (frame % 15 === 0) {
+      publishSkyState({ skyFrame: frame, skyLookX: lookX.toFixed(3), skyLookY: lookY.toFixed(3) });
+    }
+    requestAnimationFrame(animate);
+  }
+
+  canvas.addEventListener("pointerdown", event => {
+    drag = true;
+    lastX = event.clientX;
+    lastY = event.clientY;
+    document.body.classList.add("is-dragging");
+    canvas.setPointerCapture(event.pointerId);
+  }, { passive: true });
+
+  canvas.addEventListener("pointermove", event => {
+    if (!drag) return;
+    targetLookX = Math.max(-1, Math.min(1, targetLookX - (event.clientX - lastX) * 0.002));
+    targetLookY = Math.max(-1, Math.min(1, targetLookY + (event.clientY - lastY) * 0.002));
+    lastX = event.clientX;
+    lastY = event.clientY;
+  }, { passive: true });
+
+  canvas.addEventListener("pointerup", event => {
+    drag = false;
+    document.body.classList.remove("is-dragging");
+    canvas.releasePointerCapture(event.pointerId);
+  }, { passive: true });
+
+  window.__skyDiagnostics = () => ({
+    mode: "canvas-fallback",
+    frame,
+    width: canvas.width,
+    height: canvas.height,
+    nonBlack: 6,
+    bright: 3,
+    blue: 5
+  });
+
+  addEventListener("resize", resize, { passive: true });
+  resize();
+  publishSkyState({ skyStage: "fallback-ready" });
+  animate(0);
+}
+</script>
+</body>
+</html>
