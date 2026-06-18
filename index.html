@@ -4,7 +4,8 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="theme-color" content="#8fc9f4">
-  <title></title>
+  <meta name="description" content="SkynClouds, an interactive drifting sky with layered clouds and sunlight.">
+  <title>SkynClouds</title>
   <style>
     html,
     body {
@@ -15,14 +16,14 @@
       background:
         radial-gradient(circle at 36% 30%, rgba(255, 244, 208, 0.45), transparent 32%),
         linear-gradient(180deg, #6eb5ed 0%, #91cdf4 52%, #d7ecfb 100%);
-      cursor: grab;
+      cursor: none;
       touch-action: none;
       user-select: none;
       -webkit-user-select: none;
     }
 
     body.is-dragging {
-      cursor: grabbing;
+      cursor: none;
     }
 
     canvas {
@@ -31,6 +32,7 @@
       width: 100%;
       height: 100%;
       display: block;
+      z-index: 0;
     }
   </style>
 </head>
@@ -38,11 +40,21 @@
 <script type="module">
 const THREE_URL = "https://cdn.jsdelivr.net/npm/three@0.164.1/build/three.module.js";
 const skyRoot = document.documentElement;
+const reducedMotionQuery = window.matchMedia("(prefers-reduced-motion: reduce)");
+let motionScale = reducedMotionQuery.matches ? 0.42 : 1;
+reducedMotionQuery.addEventListener?.("change", event => {
+  motionScale = event.matches ? 0.42 : 1;
+  publishSkyState({ skyMotionScale: motionScale });
+});
 
 function publishSkyState(state) {
   for (const [key, value] of Object.entries(state)) {
     skyRoot.dataset[key] = String(value);
   }
+}
+
+function setSkyStatus(message) {
+  publishSkyState({ skyStatus: message });
 }
 
 window.addEventListener("error", event => {
@@ -55,12 +67,14 @@ window.addEventListener("unhandledrejection", event => {
 
 let THREE;
 publishSkyState({ skyStage: "loading" });
+setSkyStatus("Loading SkynClouds");
 try {
   THREE = await import(THREE_URL);
   publishSkyState({ skyStage: "three-imported" });
   createSky(THREE);
 } catch (error) {
   publishSkyState({ skyError: error && error.message ? error.message : "import", skyStage: "fallback" });
+  setSkyStatus("Starting fallback sky");
   createCanvasFallback();
 }
 
@@ -75,8 +89,10 @@ function createSky(THREE) {
   };
 
   const mobile = window.matchMedia("(pointer: coarse)").matches || Math.min(innerWidth, innerHeight) < 760;
-  const quality = mobile ? 0.72 : 1;
+  const quality = mobile ? 0.62 : 1;
   const maxPixelRatio = mobile ? 1.45 : 1.9;
+  const DEFAULT_YAW = -0.34;
+  const DEFAULT_TILT = 0.14;
 
   const renderer = new THREE.WebGLRenderer({
     alpha: false,
@@ -89,11 +105,12 @@ function createSky(THREE) {
   renderer.toneMappingExposure = 0.96;
   renderer.setClearColor(0x90ccf4, 1);
   renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, maxPixelRatio));
+  renderer.domElement.setAttribute("aria-hidden", "true");
   document.body.appendChild(renderer.domElement);
   publishSkyState({ skyStage: "three-renderer" });
 
   const scene = new THREE.Scene();
-  const camera = new THREE.PerspectiveCamera(64, 1, 0.1, 18000);
+  const camera = new THREE.PerspectiveCamera(mobile ? 70 : 64, 1, 0.1, 18000);
   camera.position.set(0, 0, 0);
   camera.up.set(0, 0, -1);
 
@@ -109,14 +126,15 @@ function createSky(THREE) {
   const lookDirection = new THREE.Vector3();
   const samplePixel = new Uint8Array(4);
 
-  let yaw = -0.18;
-  let tilt = 0.12;
-  let targetYaw = -0.18;
-  let targetTilt = 0.12;
+  let yaw = DEFAULT_YAW;
+  let tilt = DEFAULT_TILT;
+  let targetYaw = DEFAULT_YAW;
+  let targetTilt = DEFAULT_TILT;
   let sensorYaw = 0;
   let sensorTilt = 0;
   let sunOcclusion = 0;
   let frame = 0;
+  let sceneTime = 0;
   let cameraInitialized = false;
   let orientationBase = null;
   let orientationStarted = false;
@@ -176,8 +194,8 @@ function createSky(THREE) {
           vec3 highBlue = vec3(0.155, 0.435, 0.735);
           vec3 openBlue = vec3(0.295, 0.625, 0.915);
           vec3 paleBlue = vec3(0.715, 0.875, 0.985);
-          vec3 sky = mix(paleBlue, openBlue, smoothstep(0.02, 0.55, zenith));
-          sky = mix(sky, highBlue, pow(zenith, 1.8) * 0.55);
+      vec3 sky = mix(paleBlue, openBlue, smoothstep(0.02, 0.55, zenith));
+      sky = mix(sky, highBlue, pow(zenith, 1.8) * 0.55);
 
           float thinVariation = noise(dir.xz * 2.15 + vec2(uTime * 0.002, -uTime * 0.001));
           sky += (thinVariation - 0.5) * 0.018 * vec3(0.35, 0.55, 0.85);
@@ -188,8 +206,8 @@ function createSky(THREE) {
           float pinGlow = pow(sunDot, 1250.0) * 1.95;
           float dim = mix(1.0, 0.44, uOcclusion);
 
-          sky += vec3(1.0, 0.79, 0.48) * (warmAir + broadGlow * dim);
-          sky += vec3(1.0, 0.91, 0.72) * (tightGlow + pinGlow) * dim;
+      sky += vec3(1.0, 0.80, 0.52) * (warmAir + broadGlow * dim);
+      sky += vec3(1.0, 0.93, 0.76) * (tightGlow + pinGlow) * dim;
           sky = mix(sky, vec3(0.78, 0.895, 1.0), horizon * 0.34);
 
           float opposite = pow(max(dot(dir, -uSunDir), 0.0), 2.0);
@@ -288,19 +306,31 @@ function createSky(THREE) {
 
     void main() {
       vec3 center = iOffset;
-      center.x = wrapAxis(center.x + iDrift.x * uTime, uArea);
-      center.z = wrapAxis(center.z + iDrift.y * uTime, uArea);
+      vec2 driftDirection = normalize(iDrift + vec2(0.0001));
+      vec2 sideDirection = vec2(-driftDirection.y, driftDirection.x);
+      float windTravel = uTime * (1.0 + sin(iSeed * 3.91) * 0.12)
+        + sin(uTime * 0.045 + iSeed * 6.13) * 16.0
+        + sin(uTime * 0.016 + iSeed * 2.27) * 32.0;
+      float crossTravel = sin(uTime * 0.038 + iSeed * 9.71) * 42.0
+        + sin(uTime * 0.013 + iSeed * 5.63) * 58.0;
+      center.x = wrapAxis(center.x + iDrift.x * windTravel + sideDirection.x * crossTravel, uArea);
+      center.z = wrapAxis(center.z + iDrift.y * windTravel + sideDirection.y * crossTravel, uArea);
+      center.y += sin(uTime * 0.022 + iSeed * 4.37) * 12.0
+        + sin(uTime * 0.009 + iSeed * 1.71) * 8.0;
 
-      float breathe = 1.0 + sin(uTime * 0.018 + iSeed * 6.217) * 0.012;
-      float c = cos(iRotation);
-      float s = sin(iRotation);
+      float breatheX = 1.0 + sin(uTime * 0.021 + iSeed * 6.217) * 0.022;
+      float breatheY = 1.0 + sin(uTime * 0.017 + iSeed * 3.919) * 0.018;
+      float rotation = iRotation + sin(uTime * 0.014 + iSeed * 8.11) * 0.035;
+      float c = cos(rotation);
+      float s = sin(rotation);
       vec2 local = vec2(
         position.x * c - position.y * s,
         position.x * s + position.y * c
       );
+      local.x += local.y * sin(uTime * 0.018 + iSeed * 5.17) * 0.06;
       vec3 world = center
-        + uCameraRight * local.x * iScale.x * breathe
-        + uCameraUp * local.y * iScale.y * breathe;
+        + uCameraRight * local.x * iScale.x * breatheX
+        + uCameraUp * local.y * iScale.y * breatheY;
 
       vUv = uv;
       vSeed = iSeed;
@@ -358,10 +388,10 @@ function createSky(THREE) {
     void main() {
       vec2 p = vUv - 0.5;
       vec2 seedOffset = vec2(vSeed * 13.71, vSeed * 4.37);
-      float slowTime = uTime * 0.012;
+      float slowTime = uTime * 0.06;
       float wide = fbm(vUv * 3.15 + seedOffset + vec2(slowTime, -slowTime * 0.42));
-      float curl = fbm(vUv * 8.5 + seedOffset * 0.73 + vec2(-slowTime * 0.38, slowTime * 0.72));
-      float grain = fbm(vUv * 19.0 + seedOffset * 1.91);
+      float curl = fbm(vUv * 8.5 + seedOffset * 0.73 + vec2(-slowTime * 0.62, slowTime * 0.94));
+      float grain = fbm(vUv * 19.0 + seedOffset * 1.91 + vec2(slowTime * 1.31, slowTime * 0.47));
 
       float radius = length(p * vec2(0.96 + wide * 0.17, 1.16));
       float brokenEdge = mix(wide, curl, 0.48) + grain * 0.16;
@@ -375,7 +405,7 @@ function createSky(THREE) {
       float density = envelope * outerFalloff * mix(0.52, 1.18, brokenEdge);
       density *= mix(0.75, 1.0, lowerSoftening);
       density *= edgeFade;
-      density = pow(clamp(density, 0.0, 1.0), 1.42);
+      density = pow(clamp(density, 0.0, 1.0), 1.26);
 
       if (density < 0.012) discard;
 
@@ -389,12 +419,12 @@ function createSky(THREE) {
       vec3 milk = vec3(0.97, 0.975, 0.94);
       vec3 sunWarmth = vec3(1.0, 0.86, 0.62);
       vec3 color = mix(coolBase, milk, lit);
-      color = mix(color, vec3(0.78, 0.82, 0.86), density * 0.18);
-      color += sunWarmth * silverEdge * (0.22 + uOcclusion * 0.2);
-      color = mix(color, uHazeColor, smoothstep(700.0, 3600.0, length(vWorld)) * uHaze);
+      color = mix(color, vec3(0.78, 0.82, 0.86), density * 0.15);
+      color += sunWarmth * silverEdge * (0.26 + uOcclusion * 0.2);
+      color = mix(color, uHazeColor, smoothstep(700.0, 3900.0, length(vWorld)) * uHaze);
 
-      float alpha = density * vOpacity;
-      alpha *= mix(1.0, 0.84, smoothstep(900.0, 4200.0, length(vWorld)));
+      float alpha = density * vOpacity * 1.08;
+      alpha *= mix(1.0, 0.87, smoothstep(900.0, 4200.0, length(vWorld)));
       alpha *= mix(1.0, 0.92, uOcclusion * 0.35);
 
       gl_FragColor = vec4(color, alpha);
@@ -405,51 +435,51 @@ function createSky(THREE) {
   const layers = [
     createCloudLayer({
       seed: 13,
-      area: 7600,
-      masses: Math.round(48 * quality),
-      puffs: [7, 13],
+      area: 7800,
+      masses: Math.round(54 * quality),
+      puffs: [8, 15],
       altitude: [1080, 1560],
-      radius: [260, 620],
-      puffScale: [0.62, 1.04],
-      opacity: [0.09, 0.2],
-      speed: 0.38,
+      radius: [320, 760],
+      puffScale: [0.68, 1.12],
+      opacity: [0.1, 0.22],
+      speed: 9.0,
       yDepth: 42,
-      haze: 0.42,
+      haze: 0.48,
       layerLift: 0.2,
       renderOrder: 2,
-      sunMasses: 1
+      sunMasses: 2
     }),
     createCloudLayer({
       seed: 31,
       area: 5700,
-      masses: Math.round(54 * quality),
-      puffs: [9, 17],
+      masses: Math.round(66 * quality),
+      puffs: [10, 20],
       altitude: [700, 1080],
-      radius: [190, 440],
-      puffScale: [0.72, 1.12],
-      opacity: [0.18, 0.35],
-      speed: 0.68,
+      radius: [230, 560],
+      puffScale: [0.78, 1.2],
+      opacity: [0.18, 0.37],
+      speed: 15.5,
       yDepth: 58,
-      haze: 0.25,
+      haze: 0.28,
       layerLift: 0.1,
       renderOrder: 3,
-      sunMasses: 3
+      sunMasses: 4
     }),
     createCloudLayer({
       seed: 57,
       area: 4200,
-      masses: Math.round(28 * quality),
-      puffs: [10, 19],
+      masses: Math.round(38 * quality),
+      puffs: [12, 23],
       altitude: [460, 720],
-      radius: [145, 310],
-      puffScale: [0.82, 1.22],
-      opacity: [0.24, 0.43],
-      speed: 0.92,
+      radius: [175, 390],
+      puffScale: [0.88, 1.28],
+      opacity: [0.25, 0.46],
+      speed: 26.0,
       yDepth: 72,
       haze: 0.11,
       layerLift: 0.0,
       renderOrder: 4,
-      sunMasses: 2
+      sunMasses: 3
     })
   ];
   publishSkyState({ skyStage: "three-clouds", skyInstances: layers.reduce((total, layer) => total + layer.geometry.instanceCount, 0) });
@@ -535,6 +565,7 @@ function createSky(THREE) {
       const sinR = Math.sin(mass.rotation);
       const stretch = randomRange(random, 1.12, 2.42);
       const cross = randomRange(random, 0.58, 1.04);
+      const driftLength = Math.hypot(mass.driftX, mass.driftZ) || 1;
 
       occluders.push({
         x: mass.x,
@@ -543,6 +574,10 @@ function createSky(THREE) {
         radius: mass.radius * (mass.occludesSun ? 1.32 : 1.08),
         driftX: mass.driftX,
         driftZ: mass.driftZ,
+        sideX: -mass.driftZ / driftLength,
+        sideZ: mass.driftX / driftLength,
+        phaseA: mass.rotation * 2.91 + mass.density * 5.37,
+        phaseB: mass.rotation * 0.81 + mass.radius * 0.013,
         area: config.area,
         density: mass.density * (mass.occludesSun ? 1.0 : 0.42)
       });
@@ -628,11 +663,11 @@ function createSky(THREE) {
   }
 
   function updateCamera(elapsed, delta) {
-    const breathYaw = Math.sin(elapsed * 0.034) * 0.018 + Math.sin(elapsed * 0.011) * 0.012;
-    const breathTilt = Math.sin(elapsed * 0.027 + 1.4) * 0.012;
+    const breathYaw = Math.sin(elapsed * 0.026) * 0.012 + Math.sin(elapsed * 0.009) * 0.008;
+    const breathTilt = Math.sin(elapsed * 0.021 + 1.4) * 0.008;
     const desiredYaw = targetYaw + sensorYaw + breathYaw;
     const desiredTilt = clamp(targetTilt + sensorTilt + breathTilt, 0.02, 0.78);
-    const damping = 1 - Math.exp(-delta * 3.25);
+    const damping = 1 - Math.exp(-delta * 2.35);
 
     yaw = lerp(yaw, desiredYaw, damping);
     tilt = lerp(tilt, desiredTilt, damping);
@@ -654,10 +689,15 @@ function createSky(THREE) {
     let coverage = 0;
     const cloudPosition = new THREE.Vector3();
     for (const cloud of occluders) {
+      const windTravel = elapsed * (1 + Math.sin(cloud.phaseA) * 0.12)
+        + Math.sin(elapsed * 0.045 + cloud.phaseA) * 16.0
+        + Math.sin(elapsed * 0.016 + cloud.phaseB) * 32.0;
+      const crossTravel = Math.sin(elapsed * 0.038 + cloud.phaseA * 1.7) * 42.0
+        + Math.sin(elapsed * 0.013 + cloud.phaseB * 1.3) * 58.0;
       cloudPosition.set(
-        wrapAxis(cloud.x + cloud.driftX * elapsed, cloud.area),
-        cloud.y,
-        wrapAxis(cloud.z + cloud.driftZ * elapsed, cloud.area)
+        wrapAxis(cloud.x + cloud.driftX * windTravel + cloud.sideX * crossTravel, cloud.area),
+        cloud.y + Math.sin(elapsed * 0.022 + cloud.phaseA) * 12.0,
+        wrapAxis(cloud.z + cloud.driftZ * windTravel + cloud.sideZ * crossTravel, cloud.area)
       );
       const distance = cloudPosition.length();
       const angularRadius = Math.atan(cloud.radius / distance);
@@ -705,7 +745,8 @@ function createSky(THREE) {
 
   function animate() {
     const delta = Math.min(clock.getDelta(), 0.05);
-    const elapsed = clock.elapsedTime;
+    sceneTime += delta * motionScale;
+    const elapsed = sceneTime;
     frame++;
 
     updateCamera(elapsed, delta);
@@ -857,6 +898,7 @@ function createSky(THREE) {
 
   resize();
   publishSkyState({ skyStage: "three-ready" });
+  setSkyStatus("SkynClouds ready");
   animate();
 }
 
@@ -864,11 +906,14 @@ function createCanvasFallback() {
   publishSkyState({ skyMode: "canvas-fallback", skyStage: "fallback-start" });
   const canvas = document.createElement("canvas");
   const context = canvas.getContext("2d", { alpha: false });
+  canvas.setAttribute("aria-hidden", "true");
   document.body.appendChild(canvas);
 
   const random = mulberry32(2049);
   const clouds = [];
   let frame = 0;
+  let sceneTime = 0;
+  let lastTimestamp = 0;
   let drag = false;
   let lastX = 0;
   let lastY = 0;
@@ -877,17 +922,18 @@ function createCanvasFallback() {
   let targetLookX = 0;
   let targetLookY = 0;
 
-  for (let i = 0; i < 68; i++) {
+  for (let i = 0; i < 88; i++) {
     clouds.push({
       x: random(),
       y: random(),
-      scale: 0.6 + random() * 1.7,
-      speed: 0.000018 + random() * 0.000026,
-      opacity: 0.18 + random() * 0.44,
+      scale: 0.72 + random() * 1.85,
+      speed: 0.000042 + random() * 0.000034,
+      opacity: 0.2 + random() * 0.38,
       seed: random() * 1000,
-      puffs: 8 + Math.floor(random() * 17)
+      puffs: 11 + Math.floor(random() * 19)
     });
   }
+  clouds.sort((a, b) => a.scale - b.scale);
 
   function mulberry32(seed) {
     let value = seed >>> 0;
@@ -911,9 +957,14 @@ function createCanvasFallback() {
 
   function drawCloud(cloud, time, width, height) {
     const localRandom = mulberry32(Math.floor(cloud.seed * 1000));
-    const baseX = (((cloud.x + time * cloud.speed) % 1) * 1.18 - 0.09) * width + lookX * 70 * cloud.scale;
-    const baseY = (cloud.y * 0.86 + 0.04) * height + lookY * 46 * cloud.scale;
-    const size = Math.min(width, height) * 0.17 * cloud.scale;
+    const gust = Math.sin(time * 0.00023 + cloud.seed * 7.1) * 0.018
+      + Math.sin(time * 0.000084 + cloud.seed * 2.4) * 0.032;
+    const wander = Math.sin(time * 0.0002 + cloud.seed * 10.3) * width * 0.026 * cloud.scale;
+    const lift = Math.sin(time * 0.00016 + cloud.seed * 5.7) * height * 0.011 * cloud.scale;
+    const breathe = 1 + Math.sin(time * 0.00018 + cloud.seed * 8.9) * 0.024;
+    const baseX = (((cloud.x + time * cloud.speed + gust) % 1) * 1.18 - 0.09) * width + lookX * 70 * cloud.scale + wander;
+    const baseY = (cloud.y * 0.86 + 0.04) * height + lookY * 46 * cloud.scale + lift;
+    const size = Math.min(width, height) * 0.17 * cloud.scale * breathe;
     context.save();
     context.globalAlpha = cloud.opacity;
     context.filter = "blur(" + Math.max(8, size * 0.035) + "px)";
@@ -938,6 +989,9 @@ function createCanvasFallback() {
 
   function animate(time) {
     frame++;
+    const delta = lastTimestamp ? Math.min(time - lastTimestamp, 50) : 16;
+    lastTimestamp = time;
+    sceneTime += delta * motionScale;
     const width = innerWidth;
     const height = innerHeight;
     lookX += (targetLookX - lookX) * 0.045;
@@ -959,8 +1013,7 @@ function createCanvasFallback() {
     context.fillStyle = sun;
     context.fillRect(0, 0, width, height);
 
-    clouds.sort((a, b) => a.scale - b.scale);
-    for (const cloud of clouds) drawCloud(cloud, time, width, height);
+    for (const cloud of clouds) drawCloud(cloud, sceneTime, width, height);
     if (frame % 15 === 0) {
       publishSkyState({ skyFrame: frame, skyLookX: lookX.toFixed(3), skyLookY: lookY.toFixed(3) });
     }
@@ -1002,6 +1055,7 @@ function createCanvasFallback() {
   addEventListener("resize", resize, { passive: true });
   resize();
   publishSkyState({ skyStage: "fallback-ready" });
+  setSkyStatus("SkynClouds ready");
   animate(0);
 }
 </script>
